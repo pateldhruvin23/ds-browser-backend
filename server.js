@@ -9,13 +9,30 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// Neon PostgreSQL connection
+/* ============================
+   DATABASE CONNECTION
+============================ */
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
 })
+
+/* ============================
+   HELPER FUNCTION
+   Get internal UUID from firebase_uid
+============================ */
+
+async function getUserId(firebase_uid) {
+  const result = await pool.query(
+    "SELECT id FROM users WHERE firebase_uid = $1",
+    [firebase_uid]
+  )
+
+  if (result.rows.length === 0) return null
+
+  return result.rows[0].id
+}
 
 /* ============================
    HEALTH CHECK
@@ -38,38 +55,44 @@ app.get("/test-db", async (req, res) => {
    USERS
 ============================ */
 
-// Create user
+// Create or update user
 app.post("/users", async (req, res) => {
   try {
-    const { firebase_uid, email, name, provider } = req.body
+    const { firebase_uid, email, name, profile_image, login_provider } = req.body
 
-    await pool.query(
+    const result = await pool.query(
       `
-      INSERT INTO users (firebase_uid, email, name, provider)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO users
+      (firebase_uid, email, name, profile_image, login_provider)
+      VALUES ($1, $2, $3, $4, $5)
       ON CONFLICT (firebase_uid)
-      DO NOTHING
+      DO UPDATE SET
+        email = EXCLUDED.email,
+        name = EXCLUDED.name,
+        profile_image = EXCLUDED.profile_image,
+        login_provider = EXCLUDED.login_provider
+      RETURNING *
       `,
-      [firebase_uid, email, name, provider]
+      [firebase_uid, email, name, profile_image, login_provider]
     )
 
-    res.json({ message: "User saved" })
+    res.json(result.rows[0])
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
 })
 
 // Get user
-app.get("/users/:uid", async (req, res) => {
+app.get("/users/:firebase_uid", async (req, res) => {
   try {
-    const { uid } = req.params
-
     const result = await pool.query(
       "SELECT * FROM users WHERE firebase_uid = $1",
-      [uid]
+      [req.params.firebase_uid]
     )
 
     res.json(result.rows[0])
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -79,21 +102,26 @@ app.get("/users/:uid", async (req, res) => {
    SHORTCUTS
 ============================ */
 
-// Get all shortcuts
-app.get("/shortcuts/:uid", async (req, res) => {
+// Get shortcuts
+app.get("/shortcuts/:firebase_uid", async (req, res) => {
   try {
-    const { uid } = req.params
+    const user_id = await getUserId(req.params.firebase_uid)
+
+    if (!user_id)
+      return res.status(404).json({ error: "User not found" })
 
     const result = await pool.query(
       `
-      SELECT * FROM shortcuts
-      WHERE firebase_uid = $1
+      SELECT *
+      FROM shortcuts
+      WHERE user_id = $1
       ORDER BY is_pinned DESC, created_at DESC
       `,
-      [uid]
+      [user_id]
     )
 
     res.json(result.rows)
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -104,16 +132,23 @@ app.post("/shortcuts", async (req, res) => {
   try {
     const { firebase_uid, title, url, icon, is_pinned } = req.body
 
-    await pool.query(
+    const user_id = await getUserId(firebase_uid)
+
+    if (!user_id)
+      return res.status(404).json({ error: "User not found" })
+
+    const result = await pool.query(
       `
       INSERT INTO shortcuts
-      (firebase_uid, title, url, icon, is_pinned)
+      (user_id, title, url, icon, is_pinned)
       VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
       `,
-      [firebase_uid, title, url, icon, is_pinned]
+      [user_id, title, url, icon, is_pinned || false]
     )
 
-    res.json({ message: "Shortcut saved" })
+    res.json(result.rows[0])
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -122,22 +157,20 @@ app.post("/shortcuts", async (req, res) => {
 // Update shortcut
 app.put("/shortcuts/:id", async (req, res) => {
   try {
-    const { id } = req.params
     const { title, url, icon, is_pinned } = req.body
 
-    await pool.query(
+    const result = await pool.query(
       `
       UPDATE shortcuts
-      SET title = $1,
-          url = $2,
-          icon = $3,
-          is_pinned = $4
-      WHERE id = $5
+      SET title=$1, url=$2, icon=$3, is_pinned=$4
+      WHERE id=$5
+      RETURNING *
       `,
-      [title, url, icon, is_pinned, id]
+      [title, url, icon, is_pinned, req.params.id]
     )
 
-    res.json({ message: "Shortcut updated" })
+    res.json(result.rows[0])
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -146,14 +179,13 @@ app.put("/shortcuts/:id", async (req, res) => {
 // Delete shortcut
 app.delete("/shortcuts/:id", async (req, res) => {
   try {
-    const { id } = req.params
-
     await pool.query(
-      "DELETE FROM shortcuts WHERE id = $1",
-      [id]
+      "DELETE FROM shortcuts WHERE id=$1",
+      [req.params.id]
     )
 
     res.json({ message: "Shortcut deleted" })
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -164,20 +196,25 @@ app.delete("/shortcuts/:id", async (req, res) => {
 ============================ */
 
 // Get history
-app.get("/history/:uid", async (req, res) => {
+app.get("/history/:firebase_uid", async (req, res) => {
   try {
-    const { uid } = req.params
+    const user_id = await getUserId(req.params.firebase_uid)
+
+    if (!user_id)
+      return res.status(404).json({ error: "User not found" })
 
     const result = await pool.query(
       `
-      SELECT * FROM history
-      WHERE firebase_uid = $1
+      SELECT *
+      FROM history
+      WHERE user_id=$1
       ORDER BY visited_at DESC
       `,
-      [uid]
+      [user_id]
     )
 
     res.json(result.rows)
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -188,16 +225,23 @@ app.post("/history", async (req, res) => {
   try {
     const { firebase_uid, title, url } = req.body
 
-    await pool.query(
+    const user_id = await getUserId(firebase_uid)
+
+    if (!user_id)
+      return res.status(404).json({ error: "User not found" })
+
+    const result = await pool.query(
       `
       INSERT INTO history
-      (firebase_uid, title, url)
+      (user_id, title, url)
       VALUES ($1, $2, $3)
+      RETURNING *
       `,
-      [firebase_uid, title, url]
+      [user_id, title, url]
     )
 
-    res.json({ message: "History saved" })
+    res.json(result.rows[0])
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -208,16 +252,20 @@ app.post("/history", async (req, res) => {
 ============================ */
 
 // Get settings
-app.get("/settings/:uid", async (req, res) => {
+app.get("/settings/:firebase_uid", async (req, res) => {
   try {
-    const { uid } = req.params
+    const user_id = await getUserId(req.params.firebase_uid)
+
+    if (!user_id)
+      return res.status(404).json({ error: "User not found" })
 
     const result = await pool.query(
-      "SELECT * FROM settings WHERE firebase_uid = $1",
-      [uid]
+      "SELECT * FROM settings WHERE user_id=$1",
+      [user_id]
     )
 
     res.json(result.rows[0])
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -229,25 +277,33 @@ app.post("/settings", async (req, res) => {
     const {
       firebase_uid,
       face_id_enabled,
-      use_24h,
+      use_24_hour_time,
       theme
     } = req.body
 
-    await pool.query(
+    const user_id = await getUserId(firebase_uid)
+
+    if (!user_id)
+      return res.status(404).json({ error: "User not found" })
+
+    const result = await pool.query(
       `
       INSERT INTO settings
-      (firebase_uid, face_id_enabled, use_24h, theme)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (firebase_uid)
+      (user_id, face_id_enabled, use_24_hour_time, theme)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (user_id)
       DO UPDATE SET
-      face_id_enabled = $2,
-      use_24h = $3,
-      theme = $4
+        face_id_enabled=$2,
+        use_24_hour_time=$3,
+        theme=$4,
+        updated_at=NOW()
+      RETURNING *
       `,
-      [firebase_uid, face_id_enabled, use_24h, theme]
+      [user_id, face_id_enabled, use_24_hour_time, theme]
     )
 
-    res.json({ message: "Settings saved" })
+    res.json(result.rows[0])
+
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -260,5 +316,5 @@ app.post("/settings", async (req, res) => {
 const PORT = process.env.PORT || 3000
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
+  console.log("Server running on port", PORT)
 })
